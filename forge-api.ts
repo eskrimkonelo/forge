@@ -20,8 +20,12 @@ import {
   type Pull,
 } from './store.ts';
 
+/** The trial's fixed timestamp, rendered once: trialNowSec() never changes within a process, so
+ *  every issue/repo/pull renders the same ISO string and rebuilding it per object is pure waste. */
+let cachedIsoNow: string | null = null;
 export function isoNow(): string {
-  return new Date(trialNowSec() * 1000).toISOString();
+  if (cachedIsoNow === null) cachedIsoNow = new Date(trialNowSec() * 1000).toISOString();
+  return cachedIsoNow;
 }
 
 // ------------------------------------------------------------------ shapes

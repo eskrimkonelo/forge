@@ -21,11 +21,13 @@ export const DEFAULT_BRANCH = 'main';
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 
 /** The only "now" a request may carry: the trial's opening time, seconds. */
+let cachedTrialNowSec: number | null = null;
 export function trialNowSec(): number {
+  if (cachedTrialNowSec !== null) return cachedTrialNowSec;
   const raw = process.env.MAKEFUN_TRIAL_NOW;
   const n = raw === undefined ? NaN : Number(raw);
-  if (Number.isFinite(n) && n > 0) return Math.floor(n);
-  return 1700000000;
+  cachedTrialNowSec = Number.isFinite(n) && n > 0 ? Math.floor(n) : 1700000000;
+  return cachedTrialNowSec;
 }
 
 /** Deterministic timestamp string for a git ident line. */
@@ -219,6 +221,11 @@ export class Repo {
   readonly issueJson = new Map<number, string>();
   /** Cache: depth-1 / full pack bytes per pack key (clone workload fast path). */
   readonly packCache = new Map<string, Buffer>();
+  /** Cache: fully assembled upload-pack fetch responses per fetch key (clone workload fast path).
+   *  A response is a pure function of the object set + refs + fetch args, so it is dropped whenever
+   *  either changes (see invalidatePackCaches). V2 and V0 framings differ, so keys carry a version
+   *  prefix ('v2|' / 'v0|'). Buffers are never mutated after they are stored here. */
+  readonly fetchCache = new Map<string, Buffer>();
   /** Cache: serialized repo JSON (GET /repos fast path). */
   repoJson: string | null = null;
   /** Cache: serialized branches list. */
@@ -233,9 +240,21 @@ export class Repo {
   }
 
   // -- objects ---------------------------------------------------------------
+  /** Drop the pack/fetch caches: the object set or the refs changed, so a cached pack or fetch
+   *  response built from the old state may no longer be what the same key should answer. */
+  invalidatePackCaches(): void {
+    this.packCache.clear();
+    this.fetchCache.clear();
+  }
+
   putObject(type: ObjectType, data: Buffer): string {
     const oid = sha1Object(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data });
+      // A new object can join a later fetch's send set (a want that was missing before now resolves),
+      // so the pack/fetch caches are stale from here on.
+      this.invalidatePackCaches();
+    }
     return oid;
   }
 
@@ -251,14 +270,14 @@ export class Repo {
   setRef(name: string, oid: string): void {
     this.refs.set(name, oid);
     this.branchesJson = null;
-    this.packCache.clear();
+    this.invalidatePackCaches();
   }
 
   deleteRef(name: string): boolean {
     const ok = this.refs.delete(name);
     if (ok) {
       this.branchesJson = null;
-      this.packCache.clear();
+      this.invalidatePackCaches();
     }
     return ok;
   }

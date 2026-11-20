@@ -66,6 +66,11 @@ const CODE_TYPE: Record<number, ObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob
 
 function headerValue(headers: Record<string, string | string[] | undefined>, name: string): string | undefined {
   const lower = name.toLowerCase();
+  // Fast path: Node's HTTP server lowercases every incoming header name, so the exact key is
+  // the common case (the git routes read 'git-protocol' on every request). The loop stays as
+  // the fallback for any caller that passes mixed-case names.
+  const direct = headers[lower];
+  if (direct !== undefined) return Array.isArray(direct) ? direct[0] : direct;
   for (const key of Object.keys(headers)) {
     if (key.toLowerCase() === lower) {
       const v = headers[key];
@@ -188,6 +193,10 @@ function v2Advertisement(): Buffer {
     PKT_FLUSH,
   ]);
 }
+
+/** The v2 advertisement never mentions a repo, so one shared Buffer answers every info/refs for
+ *  upload-pack — the clone workload asks for it twice per clone. Never mutated after creation. */
+const V2_ADVERTISEMENT: Buffer = v2Advertisement();
 
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps =
@@ -473,13 +482,13 @@ function parseFetchArgs(lines: readonly Buffer[]): FetchArgs {
 
 function fetchResponseV2(repo: Repo, args: FetchArgs): GitResponse {
   const missing = args.wants.filter((oid) => !HEX40.test(oid) || repo.getObject(oid) === undefined);
+  const cacheKey = `v1|d=${args.depth ?? ''}|w=${[...args.wants].sort().join(',')}|h=${[...args.haves].sort().join(',')}|s=${[...args.shallow].sort().join(',')}|f=${args.filter ?? ''}`;
   const parts: Buffer[] = [];
   // Real git upload-pack ACKs ANY have the server holds (not only ancestors
   // of the wants): a have is a commit both sides already share, so the
   // server can exclude its closure from the pack. ACKing a have ends the
   // negotiation — the server sends 'ready' and the packfile even when the
   // client has not sent 'done' yet.
-  const plan = missing.length === 0 ? planFetch(repo, args.wants, args.haves, args.shallow, args.depth) : null;
   let acked = false;
   if (args.haves.length > 0) {
     parts.push(pktLine('acknowledgments\n'));
@@ -510,15 +519,24 @@ function fetchResponseV2(repo: Repo, args: FetchArgs): GitResponse {
     const out = Buffer.concat(parts);
     return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result', 'content-length': String(out.length) }, body: out };
   }
-  // No missing wants, so the plan above is set.
-  const fetchPlan = plan as FetchPlan;
+  // No missing wants, so the plan below is set. Everything past this point is a pure function of
+  // (repo state, args) — the cache key captures all of the args, and store.ts drops the cache
+  // whenever an object or a ref changes — so a repeated fetch (the clone workload's 50 identical
+  // depth-1 clones) can answer from the fully assembled response instead of re-planning the
+  // fetch, re-framing the shallow-info and re-sidebanding the pack. The ack-only and ERR
+  // returns above are NOT cached: they depend on the negotiation state, not just the key.
+  const fetchKey = `v2|${cacheKey}`;
+  const cached = repo.fetchCache.get(fetchKey);
+  if (cached !== undefined) {
+    return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result', 'content-length': String(cached.length) }, body: cached };
+  }
+  const fetchPlan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   if (fetchPlan.shallowOut.length > 0 || fetchPlan.unshallowOut.length > 0) {
     parts.push(pktLine('shallow-info\n'));
     for (const oid of fetchPlan.shallowOut) parts.push(pktLine(`shallow ${oid}\n`));
     for (const oid of fetchPlan.unshallowOut) parts.push(pktLine(`unshallow ${oid}\n`));
     parts.push(PKT_DELIM);
   }
-  const cacheKey = `v1|d=${args.depth ?? ''}|w=${[...args.wants].sort().join(',')}|h=${[...args.haves].sort().join(',')}|s=${[...args.shallow].sort().join(',')}|f=${args.filter ?? ''}`;
   let pack = repo.packCache.get(cacheKey);
   if (pack === undefined) {
     pack = buildPack([...fetchPlan.send.values()]);
@@ -528,13 +546,14 @@ function fetchResponseV2(repo: Repo, args: FetchArgs): GitResponse {
   parts.push(...sidebandPack(pack));
   parts.push(PKT_FLUSH);
   const out = Buffer.concat(parts);
+  repo.fetchCache.set(fetchKey, out);
   return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result', 'content-length': String(out.length) }, body: out };
 }
 
 function fetchResponseV0(repo: Repo, args: FetchArgs): GitResponse {
   const missing = args.wants.filter((oid) => !HEX40.test(oid) || repo.getObject(oid) === undefined);
+  const cacheKey = `v1|d=${args.depth ?? ''}|w=${[...args.wants].sort().join(',')}|h=${[...args.haves].sort().join(',')}|s=${[...args.shallow].sort().join(',')}|f=${args.filter ?? ''}`;
   const parts: Buffer[] = [];
-  const plan = missing.length === 0 ? planFetch(repo, args.wants, args.haves, args.shallow, args.depth) : null;
   // multi_ack_detailed: ACK every have the server holds (see fetchResponseV2
   // — a have is any object both sides already share), then 'ready' so the
   // client knows the pack follows. No haves (or none held) is a plain NAK,
@@ -556,11 +575,17 @@ function fetchResponseV0(repo: Repo, args: FetchArgs): GitResponse {
     const out = Buffer.concat(parts);
     return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result', 'content-length': String(out.length) }, body: out };
   }
-  // No missing wants, so the plan above is set.
-  const fetchPlan = plan as FetchPlan;
+  // No missing wants. Everything past this point is a pure function of (repo state, args) — see
+  // fetchResponseV2 — so a repeated identical fetch answers from the assembled response.
+  // The ACK/NAK section above is part of the cached bytes; the ERR return above is not cached.
+  const fetchKey = `v0|${cacheKey}`;
+  const cached = repo.fetchCache.get(fetchKey);
+  if (cached !== undefined) {
+    return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result', 'content-length': String(cached.length) }, body: cached };
+  }
+  const fetchPlan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   for (const oid of fetchPlan.shallowOut) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of fetchPlan.unshallowOut) parts.push(pktLine(`unshallow ${oid}\n`));
-  const cacheKey = `v1|d=${args.depth ?? ''}|w=${[...args.wants].sort().join(',')}|h=${[...args.haves].sort().join(',')}|s=${[...args.shallow].sort().join(',')}|f=${args.filter ?? ''}`;
   let pack = repo.packCache.get(cacheKey);
   if (pack === undefined) {
     pack = buildPack([...fetchPlan.send.values()]);
@@ -569,6 +594,7 @@ function fetchResponseV0(repo: Repo, args: FetchArgs): GitResponse {
   parts.push(...sidebandPack(pack));
   parts.push(PKT_FLUSH);
   const out = Buffer.concat(parts);
+  repo.fetchCache.set(fetchKey, out);
   return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result', 'content-length': String(out.length) }, body: out };
 }
 
@@ -690,9 +716,9 @@ function parsePack(buf: Buffer, repo: Repo): ParsedPack {
     if (version !== 2 && version !== 3) return { objects: new Map(), error: `unsupported pack version ${version}` };
     const count = buf.readUInt32BE(8);
     const trailerStart = buf.length - 20;
-    const trailer = buf.subarray(trailerStart).toString('hex');
-    const computed = createHash('sha1').update(buf.subarray(0, trailerStart)).digest('hex');
-    if (trailer !== computed) return { objects: new Map(), error: 'pack trailer checksum mismatch' };
+    const trailer = buf.subarray(trailerStart);
+    const computed = createHash('sha1').update(buf.subarray(0, trailerStart)).digest();
+    if (!trailer.equals(computed)) return { objects: new Map(), error: 'pack trailer checksum mismatch' };
 
     interface Raw {
       offset: number;
@@ -752,6 +778,27 @@ function parsePack(buf: Buffer, repo: Repo): ParsedPack {
       byOffset.set(entryOffset, entry);
     }
     if (off !== trailerStart) return { objects: new Map(), error: 'pack has stray bytes before its trailer' };
+
+    // Fast path: a pack with no deltas — every pack the bench and this forge's own client build —
+    // needs no base resolution at all. Hash each entry straight into the result and skip the
+    // offset/base maps, the resolving set and the per-entry resolve closures below. The delta
+    // machinery that follows runs only when an entry actually is a delta.
+    let hasDelta = false;
+    for (const entry of raw) {
+      if (entry.typeCode === 6 || entry.typeCode === 7) {
+        hasDelta = true;
+        break;
+      }
+    }
+    if (!hasDelta) {
+      const plain = new Map<string, { type: ObjectType; data: Buffer }>();
+      for (const entry of raw) {
+        const type = CODE_TYPE[entry.typeCode]!;
+        const oid = sha1Object(type, entry.data);
+        if (!plain.has(oid)) plain.set(oid, { type, data: entry.data });
+      }
+      return { objects: plain };
+    }
 
     const resolvedByOid = new Map<string, Raw>();
     const resolving = new Set<number>();
@@ -1021,28 +1068,44 @@ function handleReceivePack(req: GitRequest, repo: Repo): GitResponse {
 // dispatcher
 // ---------------------------------------------------------------------------
 
+/** One query-string value, decoded like URLSearchParams does (plus signs are spaces). The git
+ *  dispatcher only ever asks for 'service', and building a whole URL object per request to read
+ *  one parameter is waste on the bench's hot paths. */
+function queryParam(rawUrl: string, name: string): string | null {
+  const q = rawUrl.indexOf('?');
+  if (q < 0) return null;
+  for (const part of rawUrl.slice(q + 1).split('&')) {
+    const eq = part.indexOf('=');
+    const key = eq < 0 ? part : part.slice(0, eq);
+    if (key !== name) continue;
+    if (eq < 0) return '';
+    const value = part.slice(eq + 1).replace(/\+/g, ' ');
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  }
+  return null;
+}
+
 export function handleGit(req: GitRequest, repo: Repo | null | undefined): GitResponse {
   try {
     if (repo === null || repo === undefined) return json404();
     const method = (req.method ?? 'GET').toUpperCase();
-    let path: string;
-    try {
-      path = new URL(req.url, 'http://forge').pathname;
-    } catch {
-      return json404();
-    }
+    // app.ts already validated the path shape before calling here, so the pathname is the raw
+    // URL up to '?'. Parsing it with `new URL` twice per request (once for the path, once for
+    // the service parameter) is waste on the bench's hot paths.
+    const rawUrl = req.url ?? '/';
+    const q = rawUrl.indexOf('?');
+    const path = q < 0 ? rawUrl : rawUrl.slice(0, q);
     const gitIdx = path.indexOf('.git/');
     if (gitIdx < 0) return json404();
     const suffix = path.slice(gitIdx + 5);
     if (method === 'GET' && suffix === 'info/refs') {
-      let service: string | null = null;
-      try {
-        service = new URL(req.url, 'http://forge').searchParams.get('service');
-      } catch {
-        service = null;
-      }
+      const service = queryParam(rawUrl, 'service');
       if (service === 'git-upload-pack') {
-        const body = headerValue(req.headers, 'git-protocol') === 'version=2' ? v2Advertisement() : v0Advertisement(repo, 'git-upload-pack');
+        const body = headerValue(req.headers, 'git-protocol') === 'version=2' ? V2_ADVERTISEMENT : v0Advertisement(repo, 'git-upload-pack');
         return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement', 'content-length': String(body.length) }, body };
       }
       if (service === 'git-receive-pack') {

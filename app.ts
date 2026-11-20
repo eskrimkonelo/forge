@@ -97,7 +97,9 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Fast path: a small body (the bench's POSTs) arrives in one chunk, so skip the concat copy
+    // and hand the chunk itself back. Buffer.concat would allocate and copy the same bytes.
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -121,8 +123,9 @@ export function createApp(): Server {
 
       const needsBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
       const body = needsBody ? await readBody(req) : Buffer.alloc(0);
-      const query = queryStr === '' ? EMPTY_PARAMS : new URLSearchParams(queryStr);
-      const origin = `http://${req.headers.host ?? '127.0.0.1'}`;
+      // The query string and origin are only ever read by the REST branch below (page params and
+      // Link headers); building a URLSearchParams + origin string for every git/GraphQL/MCP
+      // request is pure waste on the bench's hot paths, so they are built lazily there.
 
       // GraphQL.
       if (path === '/api/graphql') {
@@ -148,6 +151,8 @@ export function createApp(): Server {
 
       // REST v3.
       if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+        const query = queryStr === '' ? EMPTY_PARAMS : new URLSearchParams(queryStr);
+        const origin = `http://${req.headers.host ?? '127.0.0.1'}`;
         const out = handleRest(forge, { method, path, query, body, authed, origin });
         if (out.status === 204) {
           res.writeHead(204, { 'x-github-request-id': nextRequestId() });
